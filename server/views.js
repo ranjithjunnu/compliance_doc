@@ -1,0 +1,143 @@
+'use strict';
+// Read models. Dashboards, reports and chat all use these same queries, so they cannot disagree.
+const db = require('./lib/db'), { clock, j, daysBetween, addDays, csvCell } = require('./lib/util');
+const P = require('./platform'), R = require('./registry'), E = require('./engine');
+const { canSeeRestricted } = P;
+const llm = require('./llm');
+const isoDay = 864e5;
+
+function controlMap(t) {
+  const m = {};
+  for (const c of R.effectiveControls(t)) m[c.key] = c;
+  return m;
+}
+function allChecks(t) {
+  const cm = controlMap(t);
+  const fac = {};
+  for (const r of db.all(`SELECT a.worker_id, f.name FROM assignments a JOIN facilities f ON f.id=a.facility_id WHERE a.tenant_id=? AND a.status='active'`, t)) fac[r.worker_id] = r.name;
+  const names = {};
+  for (const r of db.all('SELECT id,name,status FROM workers WHERE tenant_id=?', t)) names[r.id] = r.name;
+  for (const r of db.all('SELECT id,name FROM entities WHERE tenant_id=?', t)) names[r.id] = r.name;
+  return db.all('SELECT * FROM evaluations WHERE tenant_id=? AND is_current=1', t).filter((e) => cm[e.control_key]).map((e) => ({
+    id: e.id, subject_type: e.subject_type, subject_id: e.subject_id, subject_name: names[e.subject_id] || e.subject_id, facility: e.subject_type === 'worker' ? fac[e.subject_id] || 'No confirmed location' : 'Company level', pack_key: e.pack_key, pack_name: cm[e.control_key].pack_name, team: cm[e.control_key].team, restricted: cm[e.control_key].restricted, control_key: e.control_key, control_name: cm[e.control_key].name, requirement_type: cm[e.control_key].requirement_type, control_version: e.control_version, status: e.status, code: e.code, reason: e.reason, evidence_ids: j(e.evidence_ids_json, []), action_needed: !!e.action_needed, evaluated_at: e.evaluated_at,
+  }));
+}
+function checks(t, user, f = {}) {
+  let rows = allChecks(t).filter((c) => !c.restricted || canSeeRestricted(user));
+  if (f.status) rows = rows.filter((c) => c.status === f.status);
+  if (f.pack) rows = rows.filter((c) => c.pack_key === f.pack);
+  if (f.subject) rows = rows.filter((c) => c.subject_id === f.subject);
+  return rows;
+}
+function tally(rows) {
+  const o = { total: 0, pass: 0, fail: 0, unknown: 0, not_applicable: 0 };
+  for (const r of rows) { o[r.status]++; if (r.status !== 'not_applicable') o.total++; }
+  return o;
+}
+function packRows(t) {
+  const all = allChecks(t), tps = db.all('SELECT * FROM tenant_packs WHERE tenant_id=?', t), users = {};
+  for (const u of db.all('SELECT id,name FROM users WHERE tenant_id=?', t)) users[u.id] = u.name;
+  return R.allPacks().map((p) => {
+    const tp = tps.find((x) => x.pack_key === p.key), rows = all.filter((c) => c.pack_key === p.key), a = tally(rows);
+    return { key: p.key, name: p.name, icon: p.icon, description: p.description, version: tp?.version || p.version, latest_version: p.version, pilot: !!p.pilot, team: p.team, owner_role: p.owner_role, status: tp?.status || 'inactive', mode: tp?.mode || null, owner: users[tp?.owner_user_id] || null, owner_user_id: tp?.owner_user_id || null, reviewed_by: tp?.reviewed_by || null, activated_at: tp?.activated_at || null, ...a, open_cases: db.get(`SELECT COUNT(*) n FROM cases WHERE tenant_id=? AND pack_key=? AND ${E.OPEN}`, t, p.key).n, unvalidated: db.get(`SELECT COUNT(*) n FROM cases WHERE tenant_id=? AND pack_key=? AND ${E.OPEN} AND finding_verdict IS NULL`, t, p.key).n, controls: p.controls.map((c) => ({ key: c.key, name: c.name, requirement_type: c.requirement_type, source: c.source, type: c.type, schedule: c.remediation })), review_note: p.review_note, validation: p.validation };
+  });
+}
+function coverage(t) {
+  const rows = allChecks(t), a = tally(rows), packs = packRows(t).filter((p) => p.status === 'active');
+  return { ...a, packs: packs.map((p) => p.name), as_of: clock.iso(), scope_statement: packs.length ? `${a.total} applicable checks in ${packs.length} activated pack(s). Obligations outside these packs have not been assessed.` : 'No packs are activated, so nothing has been assessed.', all_pass: a.total > 0 && a.pass === a.total };
+}
+function listCases(t, user, f = {}) {
+  let rows = db.all(`SELECT c.*, u.name owner_name FROM cases c LEFT JOIN users u ON u.id=c.owner_user_id WHERE c.tenant_id=? ${f.closed ? 'AND c.closed_at IS NOT NULL' : 'AND c.closed_at IS NULL'} ORDER BY CASE c.priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, c.due_date`, t);
+  rows = rows.filter((c) => !c.restricted || canSeeRestricted(user));
+  if (f.pack) rows = rows.filter((c) => c.pack_key === f.pack);
+  return rows;
+}
+function caseDetail(t, user, cid) {
+  const c = db.get('SELECT c.*, u.name owner_name FROM cases c LEFT JOIN users u ON u.id=c.owner_user_id WHERE c.id=? AND c.tenant_id=?', cid, t);
+  if (!c) throw new P.HttpError(404, 'Case not found.');
+  if (c.restricted && !canSeeRestricted(user)) throw new P.HttpError(403, 'This case is restricted.');
+  const ev = db.get('SELECT * FROM evaluations WHERE tenant_id=? AND subject_type=? AND subject_id=? AND control_key=? AND is_current=1', t, c.subject_type, c.subject_id, c.control_key);
+  return { ...c, evaluation: ev ? { ...ev, evidence_ids: j(ev.evidence_ids_json, []) } : null, timeline: db.all('SELECT ts,type,action,actor FROM audit_log WHERE tenant_id=? AND case_id=? ORDER BY seq', t, cid), actions: db.all('SELECT id,type,status,recipient,subject,sent_at,created_at,error FROM actions WHERE case_id=? AND tenant_id=? ORDER BY created_at', cid, t), notes: db.all('SELECT * FROM case_notes WHERE case_id=? AND tenant_id=? ORDER BY created_at', cid, t), evidence: db.all('SELECT id,filename,status,doc_type,expires_on,confidence,review_reasons_json,created_at FROM evidence WHERE tenant_id=? AND subject_type=? AND subject_id=? AND (control_key=? OR case_id=?) ORDER BY created_at DESC', t, c.subject_type, c.subject_id, c.control_key, cid).map((x) => ({ ...x, review_reasons: j(x.review_reasons_json, []) })) };
+}
+const ROLL = (rows) => !rows.length ? 'not_applicable' : rows.some((r) => r.status === 'fail') ? 'fail' : rows.some((r) => r.status === 'unknown') ? 'unknown' : rows.every((r) => r.status === 'not_applicable') ? 'not_applicable' : 'pass';
+function listWorkers(t, user) {
+  const all = allChecks(t), facs = {};
+  for (const r of db.all(`SELECT a.worker_id, f.name, f.state FROM assignments a JOIN facilities f ON f.id=a.facility_id WHERE a.tenant_id=? AND a.status='active'`, t)) facs[r.worker_id] = r;
+  return db.all('SELECT * FROM workers WHERE tenant_id=? ORDER BY name', t).map((w) => {
+    const mine = all.filter((c) => c.subject_type === 'worker' && c.subject_id === w.id), packs = {};
+    for (const k of ['onboarding', 'healthcare', 'immigration', 'payroll']) packs[k] = (k === 'immigration' && !canSeeRestricted(user)) ? 'restricted' : ROLL(mine.filter((c) => c.pack_key === k));
+    const applicable = mine.filter((c) => c.status !== 'not_applicable');
+    return { id: w.id, name: w.name, email: w.email, role: w.role, category: w.category, dept: w.dept, status: w.status, hire_date: w.hire_date, source: w.source, readiness: w.readiness, facility: facs[w.id]?.name || null, state: facs[w.id]?.state || null, packs, checks: tally(mine), overall: !applicable.length ? 'not_assessed' : ROLL(applicable) };
+  });
+}
+function workerDetail(t, user, wid) {
+  const w = listWorkers(t, user).find((x) => x.id === wid);
+  if (!w) throw new P.HttpError(404, 'Worker not found.');
+  const ch = checks(t, user, { subject: wid }), blockers = ch.filter((c) => c.status === 'fail' || c.status === 'unknown');
+  const summary = ['onboarding', 'healthcare', 'immigration', 'payroll'].map((k) => ({ pack: k, status: w.packs[k], open: ch.filter((c) => c.pack_key === k && ['fail', 'unknown'].includes(c.status)).length }));
+  return { ...w, checks_list: ch, cases: listCases(t, user).filter((c) => c.subject_id === wid), readiness_view: { summary, blockers: blockers.map((b) => ({ control: b.control_name, pack: b.pack_key, status: b.status, reason: b.reason })), statement: blockers.length ? `Assignment readiness remains pending: ${blockers.length} check(s) unresolved.` : w.checks.total ? 'All checks in activated packs pass. An authorized owner makes the readiness decision.' : 'No checks have been run yet.' } };
+}
+function listEvidence(t, user) {
+  const names = {};
+  for (const r of db.all('SELECT id,name FROM workers WHERE tenant_id=? UNION SELECT id,name FROM entities WHERE tenant_id=?', t, t)) names[r.id] = r.name;
+  return db.all('SELECT * FROM evidence WHERE tenant_id=? ORDER BY created_at DESC', t).filter((e) => !e.restricted || canSeeRestricted(user)).map((e) => ({ id: e.id, subject_name: names[e.subject_id], subject_type: e.subject_type, subject_id: e.subject_id, doc_type: e.doc_type, status: e.status, source: e.source, filename: e.filename, doc_number: e.doc_number, holder_name: e.holder_name, state: e.state, entity_name: e.entity_name, period: e.period, issued_on: e.issued_on, expires_on: e.expires_on, confidence: e.confidence, field_confidence: j(e.fields_json, {}), review_reasons: j(e.review_reasons_json, []), flags: j(e.flags_json, []), control_key: e.control_key, reviewed_by: e.reviewed_by, reject_reason: e.reject_reason, created_at: e.created_at, has_file: !!e.stored_path }));
+}
+function listApprovals(t, user, status = 'pending') {
+  return db.all('SELECT * FROM approvals WHERE tenant_id=? AND status=? ORDER BY created_at DESC', t, status).filter((a) => (a.pack_key ? P.canPack(user, a.pack_key) : P.isAdmin(user)));
+}
+function overview(t, user) {
+  const cov = coverage(t), open = listCases(t, user), m = metrics(t);
+  const workers = listWorkers(t, user);
+  return { coverage: cov, packs: packRows(t).filter((p) => p.status === 'active'), urgent: open.slice(0, 6), feed: db.all('SELECT seq,ts,type,action FROM audit_log WHERE tenant_id=? ORDER BY seq DESC LIMIT 8', t), kpi: { open_cases: open.length, expiring: allChecks(t).filter((c) => c.code === 'expiring').length, missing_onboarding: open.filter((c) => c.pack_key === 'onboarding').length, specialist: open.filter((c) => ['immigration', 'payroll'].includes(c.pack_key)).length, workers: workers.filter((w) => w.status === 'active').length, clinical: workers.filter((w) => w.category === 'clinical' && w.status === 'active').length, corporate: workers.filter((w) => w.category !== 'clinical' && w.status === 'active').length, with_gaps: workers.filter((w) => ['fail', 'unknown'].includes(w.overall)).length, pending_approvals: listApprovals(t, user).length, ...m } };
+}
+function metrics(t) {
+  const base = (k) => db.get('SELECT value FROM baselines WHERE tenant_id=? AND key=?', t, k)?.value ?? null;
+  const closed = db.all('SELECT * FROM cases WHERE tenant_id=? AND closed_at IS NOT NULL', t), verified = closed.filter((c) => c.closure === 'verified');
+  const hrs = verified.map((c) => (new Date(c.closed_at) - new Date(c.opened_at)) / 36e5).sort((a, b) => a - b);
+  const auto = P.counter(t, 'automated_messages'), mins = base('minutes_per_chase');
+  const dupSent = db.get(`SELECT COUNT(*) n FROM (SELECT action_id FROM messages WHERE tenant_id=? AND action_id IS NOT NULL GROUP BY action_id HAVING COUNT(*)>1)`, t).n;
+  const reviewed = db.all('SELECT finding_verdict v FROM cases WHERE tenant_id=? AND finding_verdict IS NOT NULL', t);
+  const cov = tally(allChecks(t)), tn = db.get('SELECT * FROM tenants WHERE id=?', t);
+  const manual = db.get('SELECT COALESCE(SUM(minutes),0) m FROM manual_support WHERE tenant_id=?', t).m;
+  return { automated_messages: auto, minutes_per_chase: mins, baseline_hours_per_month: base('hours_per_month'), hours_saved: mins === null ? null : Math.round(auto * mins / 6) / 10, cases_closed: closed.length, verified_closures: verified.length, closures_with_evidence: verified.filter((c) => c.closure_evidence_id).length, median_closure_hours: hrs.length ? Math.round(hrs[Math.floor(hrs.length / 2)] * 10) / 10 : null, findings_reviewed: reviewed.length, false_findings: reviewed.filter((r) => r.v === 'false_finding').length, unknown_results: cov.unknown, duplicates_blocked: P.counter(t, 'duplicates_blocked'), duplicate_messages_sent: dupSent, onboarding_minutes: tn.first_assessment_at ? Math.round((new Date(tn.first_assessment_at) - new Date(tn.created_at)) / 6e4) : null, manual_support_minutes: manual, llm_calls: P.counter(t, 'llm_calls'), llm_tokens: P.counter(t, 'llm_input_tokens') + P.counter(t, 'llm_output_tokens') };
+}
+function dashboardData(t, user, def) {
+  let rows = checks(t, user, { pack: def.pack });
+  if (def.metric === 'missing_evidence') rows = rows.filter((c) => ['missing_evidence', 'not_yet_received', 'missing_filing_evidence', 'overdue'].includes(c.code));
+  else if (def.metric === 'expirations') rows = rows.filter((c) => ['expiring', 'expired'].includes(c.code));
+  else if (def.metric === 'open_gaps') rows = rows.filter((c) => ['fail', 'unknown'].includes(c.status));
+  else rows = rows.filter((c) => c.status !== 'not_applicable');
+  const key = { facility: 'facility', team: 'team', pack: 'pack_name', status: 'status', control: 'control_name' }[def.group_by] || 'facility', g = {};
+  for (const r of rows) (g[r[key]] ||= []).push(r);
+  return { total: rows.length, groups: Object.entries(g).map(([name, items]) => ({ name, count: items.length, items: items.map((i) => ({ subject: i.subject_name, control: i.control_name, status: i.status, reason: i.reason })) })).sort((a, b) => b.count - a.count) };
+}
+function dashboardsFor(t, user) { return db.all('SELECT * FROM dashboards WHERE tenant_id=? ORDER BY created_at DESC', t).filter((d) => P.isAdmin(user) || j(d.roles_json, []).includes(user.role)); }
+function reportCsv(t, user, pack) {
+  const rows = checks(t, user, pack === 'all' ? {} : { pack }), cov = coverage(t);
+  const lines = [['Subject', 'Facility', 'Pack', 'Control', 'Requirement type', 'Status', 'Reason', 'Evidence references', 'Control version', 'Evaluated at']];
+  for (const r of rows) lines.push([r.subject_name, r.facility, r.pack_name, r.control_name, r.requirement_type, r.status, r.reason, r.evidence_ids.join(' '), r.control_version, r.evaluated_at]);
+  lines.push([]); lines.push([`Scope: ${cov.scope_statement} Evidence current as of ${cov.as_of}.`]);
+  return lines.map((l) => l.map(csvCell).join(',')).join('\n');
+}
+function setupState(t) {
+  const tn = db.get('SELECT * FROM tenants WHERE id=?', t), s = j(tn.setup_json, {}), ws = db.all("SELECT * FROM workers WHERE tenant_id=? AND status='active'", t);
+  const noLoc = ws.filter((w) => !E.currentFacility(t, w.id)), facs = db.all('SELECT * FROM facilities WHERE tenant_id=? ORDER BY name', t), ents = db.all('SELECT * FROM entities WHERE tenant_id=? ORDER BY name', t);
+  const clinical = ws.filter((w) => w.category === 'clinical').length;
+  const gaps = [];
+  if (noLoc.length) gaps.push(`${noLoc.length} worker(s) have no confirmed work location.`);
+  const unf = facs.filter((f) => !f.requirements_confirmed);
+  if (unf.length) gaps.push(`Facility requirements are not confirmed for ${unf.length} location(s).`);
+  if (!ents.length) gaps.push('No employing entity on record.');
+  if (ws.some((w) => !w.email)) gaps.push(`${ws.filter((w) => !w.email).length} worker(s) have no email address.`);
+  if (ws.length) gaps.push('Payroll filing evidence is not available from HR records and must be uploaded.');
+  const packs = packRows(t);
+  return { tenant: tn.name, kind: tn.kind, summary: { workers: ws.length, clinical, facilities: facs.length, entities: ents.length }, gaps, facilities: facs.map((f) => ({ ...f, requirements: j(f.requirements_json, []) })), entities: ents, steps: { connect: ws.length > 0, context: !!s.context_confirmed, packs: packs.some((p) => p.status === 'active'), channel: !!s.channel_confirmed, assessed: !!tn.first_assessment_at }, recommended: packs.map((p) => ({ key: p.key, name: p.name, icon: p.icon, description: p.description, recommended: p.key === 'healthcare' ? clinical > 0 : ws.length > 0, status: p.status, owner_role: p.owner_role, owner_user_id: p.owner_user_id, controls: p.controls, review_note: p.review_note, version: p.latest_version, validation: p.validation })), channel: j(tn.channel_json, {}), slack_ready: !!process.env.SLACK_BOT_TOKEN, coverage: coverage(t), users: db.all('SELECT id,name,role FROM users WHERE tenant_id=?', t) };
+}
+function digestText(t) {
+  const c = coverage(t), open = db.all(`SELECT * FROM cases WHERE tenant_id=? AND ${E.OPEN}`, t), pend = db.get("SELECT COUNT(*) n FROM approvals WHERE tenant_id=? AND status='pending'", t).n;
+  return `Aegis digest for ${clock.today()}\n${c.pass} pass, ${c.fail} fail, ${c.unknown} unknown across ${c.total} applicable checks.\n${open.length} open case(s), ${open.filter((x) => x.escalated).length} escalated. ${pend} awaiting approval.\n${c.scope_statement}`;
+}
+function health(t) {
+  return { ai_error: llm.lastError(t), jobs: { queued: db.get("SELECT COUNT(*) n FROM jobs WHERE tenant_id=? AND status='queued'", t).n, dead: db.all("SELECT id,type,last_error,attempts,finished_at FROM jobs WHERE tenant_id=? AND status='dead' ORDER BY finished_at DESC LIMIT 20", t) }, failed_actions: db.all("SELECT id,type,recipient,error FROM actions WHERE tenant_id=? AND error IS NOT NULL AND status='queued' LIMIT 20", t), connectors: db.all('SELECT id,type,name,status,last_sync_at,last_error,records,capabilities_json FROM connectors WHERE tenant_id=?', t).map((c) => ({ ...c, capabilities: j(c.capabilities_json, []) })), events: db.all('SELECT type,status,received_at,error FROM events WHERE tenant_id=? ORDER BY received_at DESC LIMIT 10', t), schedules: db.all('SELECT * FROM schedules WHERE tenant_id=?', t), audit: P.verifyAudit(t) };
+}
+module.exports = { checks, coverage, tally, packRows, listCases, caseDetail, listWorkers, workerDetail, listEvidence, listApprovals, overview, metrics, dashboardData, dashboardsFor, reportCsv, setupState, digestText, health, allChecks, isoDay, addDays, daysBetween };

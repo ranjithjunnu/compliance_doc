@@ -1,0 +1,86 @@
+{
+ "key": "immigration",
+ "name": "Immigration & Work Authorization",
+ "icon": "🛡️",
+ "version": "0.8.0",
+ "team": "Immigration",
+ "owner_role": "immigration_owner",
+ "recommended_when": "always",
+ "pilot": true,
+ "restricted": true,
+ "description": "Reviewed verification tasks and milestones. Specialist review only. The coworker gives no legal interpretation.",
+ "review_note": "Starter content. The responsible owner must review applicability, source and deadline before activation.",
+ "reporting_views": [
+  "activated_scope"
+ ],
+ "controls": [
+  {
+   "key": "CTRL-IMM-I9",
+   "name": "Employment verification record",
+   "requirement_type": "regulatory",
+   "source": "USCIS Form I-9 instructions (owner to confirm)",
+   "subject": "worker",
+   "type": "document_required",
+   "priority": "high",
+   "applies_when": {},
+   "params": {
+    "deadline_days_from_hire": 3
+   },
+   "evidence": {
+    "doc_types": [
+     "i9_record"
+    ],
+    "auto_accept": false,
+    "required_fields": [
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "route": "owner_task",
+    "reminder_every_days": 1,
+    "max_reminders": 2
+   }
+  },
+  {
+   "key": "CTRL-IMM-REVERIFY",
+   "name": "Work authorization reverification",
+   "requirement_type": "regulatory",
+   "source": "USCIS guidance (owner to confirm)",
+   "subject": "worker",
+   "type": "credential_current",
+   "priority": "high",
+   "applies_when": {
+    "has": "work_auth_expires"
+   },
+   "params": {},
+   "evidence": {
+    "doc_types": [
+     "work_authorization"
+    ],
+    "auto_accept": false,
+    "required_fields": [
+     "expires_on",
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "request_days_before": 90,
+    "route": "owner_task",
+    "reminder_every_days": 7,
+    "max_reminders": 2
+   }
+  }
+ ],
+ "tests": [
+  {
+   "control": "CTRL-IMM-I9",
+   "subject": {
+    "status": "active",
+    "hire_date": "2099-01-01"
+   },
+   "evidence": [],
+   "expect": "unknown",
+   "name": "Awaiting record stays unknown"
+  }
+ ]
+}

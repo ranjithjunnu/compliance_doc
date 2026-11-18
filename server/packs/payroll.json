@@ -1,0 +1,105 @@
+{
+ "key": "payroll",
+ "name": "Payroll & Tax",
+ "icon": "💰",
+ "version": "1.1.0",
+ "team": "Payroll & Finance",
+ "owner_role": "finance",
+ "recommended_when": "always",
+ "pilot": true,
+ "description": "Approved registration, filing and setup controls. Consequential payroll changes stay with finance.",
+ "review_note": "Starter content. The responsible owner must review applicability, source and deadline before activation.",
+ "reporting_views": [
+  "activated_scope"
+ ],
+ "controls": [
+  {
+   "key": "CTRL-PAY-SETUP",
+   "name": "Payroll setup fields",
+   "requirement_type": "internal",
+   "source": "Payroll procedures",
+   "subject": "worker",
+   "type": "field_required",
+   "priority": "medium",
+   "applies_when": {},
+   "params": {
+    "fields": [
+     "tax_state",
+     "pay_method"
+    ]
+   },
+   "evidence": {
+    "doc_types": [],
+    "auto_accept": false,
+    "required_fields": []
+   },
+   "remediation": {
+    "route": "owner_task"
+   }
+  },
+  {
+   "key": "CTRL-PAY-W4",
+   "name": "Federal withholding certificate",
+   "requirement_type": "regulatory",
+   "source": "IRS Form W-4 (owner to confirm)",
+   "subject": "worker",
+   "type": "document_required",
+   "priority": "medium",
+   "applies_when": {},
+   "params": {
+    "deadline_days_from_hire": 14
+   },
+   "evidence": {
+    "doc_types": [
+     "w4"
+    ],
+    "auto_accept": false,
+    "required_fields": [
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker"
+   }
+  },
+  {
+   "key": "CTRL-PAY-941",
+   "name": "Quarterly payroll filing evidence",
+   "requirement_type": "regulatory",
+   "source": "Approved filing calendar (owner to confirm)",
+   "subject": "entity",
+   "type": "periodic_filing",
+   "priority": "high",
+   "applies_when": {},
+   "params": {},
+   "evidence": {
+    "doc_types": [
+     "payroll_filing_receipt"
+    ],
+    "auto_accept": false,
+    "required_fields": [
+     "entity_name",
+     "period"
+    ]
+   },
+   "remediation": {
+    "route": "owner_task",
+    "reminder_every_days": 3,
+    "max_reminders": 2
+   }
+  }
+ ],
+ "tests": [
+  {
+   "control": "CTRL-PAY-941",
+   "subject": {
+    "name": "Acme"
+   },
+   "evidence": [],
+   "expect": "unknown",
+   "name": "Missing receipt is unknown, not pass"
+  }
+ ]
+}

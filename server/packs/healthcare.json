@@ -1,0 +1,276 @@
+{
+ "key": "healthcare",
+ "name": "Healthcare Workforce",
+ "icon": "🩺",
+ "version": "2.1.0",
+ "team": "Healthcare Compliance",
+ "owner_role": "healthcare_compliance",
+ "recommended_when": "clinical",
+ "description": "Licenses, certifications, health screening and facility requirements.",
+ "review_note": "Starter content. The responsible owner must review applicability, source and deadline before activation.",
+ "reporting_views": [
+  "expirations",
+  "missing_by_facility"
+ ],
+ "controls": [
+  {
+   "key": "CTRL-HC-LICENSE",
+   "name": "Professional license",
+   "requirement_type": "regulatory",
+   "source": "State licensing board (owner to confirm per state)",
+   "subject": "worker",
+   "type": "credential_current",
+   "priority": "high",
+   "applies_when": {
+    "category": [
+     "clinical"
+    ],
+    "license_type": [
+     "RN",
+     "NP",
+     "MD",
+     "PT"
+    ]
+   },
+   "params": {
+    "state_must_match": true
+   },
+   "evidence": {
+    "doc_types": [
+     "professional_license"
+    ],
+    "auto_accept": true,
+    "required_fields": [
+     "doc_number",
+     "expires_on",
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "request_days_before": 30,
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker",
+    "on_escalate": "assignment_review"
+   }
+  },
+  {
+   "key": "CTRL-HC-BLS",
+   "name": "BLS provider card",
+   "requirement_type": "contract",
+   "source": "Client contract / facility credentialing policy",
+   "subject": "worker",
+   "type": "credential_current",
+   "priority": "high",
+   "applies_when": {
+    "category": [
+     "clinical"
+    ]
+   },
+   "params": {},
+   "evidence": {
+    "doc_types": [
+     "bls_card"
+    ],
+    "auto_accept": true,
+    "required_fields": [
+     "expires_on",
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "request_days_before": 30,
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker",
+    "on_escalate": "assignment_review"
+   }
+  },
+  {
+   "key": "CTRL-HC-ACLS",
+   "name": "ACLS provider card",
+   "requirement_type": "facility_policy",
+   "source": "Facility credentialing policy",
+   "subject": "worker",
+   "type": "credential_current",
+   "priority": "high",
+   "applies_when": {
+    "facility_requires": "acls",
+    "category": [
+     "clinical"
+    ]
+   },
+   "params": {},
+   "evidence": {
+    "doc_types": [
+     "acls_card"
+    ],
+    "auto_accept": true,
+    "required_fields": [
+     "expires_on",
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "request_days_before": 30,
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker",
+    "on_escalate": "assignment_review"
+   }
+  },
+  {
+   "key": "CTRL-HC-TB",
+   "name": "TB screening",
+   "requirement_type": "facility_policy",
+   "source": "Facility occupational health policy",
+   "subject": "worker",
+   "type": "credential_current",
+   "priority": "medium",
+   "applies_when": {
+    "category": [
+     "clinical"
+    ]
+   },
+   "params": {
+    "max_age_days": 365
+   },
+   "evidence": {
+    "doc_types": [
+     "tb_screening"
+    ],
+    "auto_accept": false,
+    "required_fields": [
+     "issued_on",
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "request_days_before": 30,
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker"
+   }
+  },
+  {
+   "key": "CTRL-HC-FLU",
+   "name": "Flu vaccination record",
+   "requirement_type": "facility_policy",
+   "source": "Facility policy (seasonal)",
+   "subject": "worker",
+   "type": "credential_current",
+   "priority": "medium",
+   "applies_when": {
+    "facility_requires": "flu_vaccine",
+    "category": [
+     "clinical"
+    ]
+   },
+   "params": {
+    "max_age_days": 365
+   },
+   "evidence": {
+    "doc_types": [
+     "flu_vaccine"
+    ],
+    "auto_accept": false,
+    "required_fields": [
+     "issued_on",
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "request_days_before": 30,
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker"
+   }
+  },
+  {
+   "key": "CTRL-HC-ORIENT",
+   "name": "Facility orientation",
+   "requirement_type": "contract",
+   "source": "Client contract",
+   "subject": "worker",
+   "type": "document_required",
+   "priority": "medium",
+   "applies_when": {
+    "facility_requires": "facility_orientation",
+    "category": [
+     "clinical"
+    ]
+   },
+   "params": {},
+   "evidence": {
+    "doc_types": [
+     "facility_orientation"
+    ],
+    "auto_accept": true,
+    "required_fields": [
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker"
+   }
+  }
+ ],
+ "tests": [
+  {
+   "control": "CTRL-HC-BLS",
+   "subject": {
+    "status": "active",
+    "category": "clinical"
+   },
+   "evidence": [],
+   "expect": "unknown",
+   "name": "Missing evidence never passes"
+  },
+  {
+   "control": "CTRL-HC-BLS",
+   "subject": {
+    "status": "active",
+    "category": "clinical"
+   },
+   "evidence": [
+    {
+     "id": "e",
+     "doc_type": "bls_card",
+     "status": "accepted",
+     "expires_on": "2020-01-01"
+    }
+   ],
+   "expect": "fail",
+   "name": "Expired card fails"
+  },
+  {
+   "control": "CTRL-HC-BLS",
+   "subject": {
+    "status": "active",
+    "category": "corporate"
+   },
+   "evidence": [],
+   "expect": "not_applicable",
+   "name": "Corporate staff not applicable"
+  },
+  {
+   "control": "CTRL-HC-BLS",
+   "subject": {
+    "status": "active",
+    "category": "clinical"
+   },
+   "evidence": [
+    {
+     "id": "e",
+     "doc_type": "bls_card",
+     "status": "needs_review",
+     "expires_on": "2099-01-01"
+    }
+   ],
+   "expect": "unknown",
+   "name": "Unreviewed upload never passes"
+  }
+ ]
+}

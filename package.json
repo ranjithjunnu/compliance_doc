@@ -1,0 +1,17 @@
+{
+  "name": "aegis-compliance-coworker",
+  "version": "0.1.0",
+  "private": true,
+  "description": "AI Compliance Coworker MVP - backend and web workspace. No npm dependencies.",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "start": "node --no-warnings server/index.js",
+    "test": "node --no-warnings --test test/workflow.test.js test/ai.test.js"
+  },
+  "dependencies": {
+    "nodemailer": "^10.4.0",
+    "pg": "^8.23.1"
+  }
+}

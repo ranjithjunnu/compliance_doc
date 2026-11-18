@@ -1,0 +1,105 @@
+{
+ "key": "onboarding",
+ "name": "Employee Onboarding",
+ "icon": "👥",
+ "version": "1.4.2",
+ "team": "HR Operations",
+ "owner_role": "hr",
+ "recommended_when": "always",
+ "description": "Company documents, policy acknowledgments and onboarding tasks.",
+ "review_note": "Starter content. The responsible owner must review applicability, source and deadline before activation.",
+ "reporting_views": [
+  "readiness"
+ ],
+ "controls": [
+  {
+   "key": "CTRL-ONB-HANDBOOK",
+   "name": "Handbook acknowledgment",
+   "requirement_type": "internal",
+   "source": "Company policy",
+   "subject": "worker",
+   "type": "document_required",
+   "priority": "low",
+   "applies_when": {},
+   "params": {
+    "deadline_days_from_hire": 7
+   },
+   "evidence": {
+    "doc_types": [
+     "handbook_ack"
+    ],
+    "auto_accept": true,
+    "required_fields": [
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "reminder_every_days": 2,
+    "max_reminders": 3,
+    "route": "worker"
+   }
+  },
+  {
+   "key": "CTRL-ONB-SEC",
+   "name": "Security training certificate",
+   "requirement_type": "internal",
+   "source": "Company policy",
+   "subject": "worker",
+   "type": "document_required",
+   "priority": "low",
+   "applies_when": {},
+   "params": {
+    "deadline_days_from_hire": 14
+   },
+   "evidence": {
+    "doc_types": [
+     "security_training"
+    ],
+    "auto_accept": true,
+    "required_fields": [
+     "holder_name"
+    ]
+   },
+   "remediation": {
+    "reminder_every_days": 3,
+    "max_reminders": 2,
+    "route": "worker"
+   }
+  },
+  {
+   "key": "CTRL-ONB-EMERG",
+   "name": "Emergency contact on record",
+   "requirement_type": "internal",
+   "source": "Company policy",
+   "subject": "worker",
+   "type": "field_required",
+   "priority": "low",
+   "applies_when": {},
+   "params": {
+    "fields": [
+     "emergency_contact"
+    ]
+   },
+   "evidence": {
+    "doc_types": [],
+    "auto_accept": false,
+    "required_fields": []
+   },
+   "remediation": {
+    "route": "owner_task"
+   }
+  }
+ ],
+ "tests": [
+  {
+   "control": "CTRL-ONB-HANDBOOK",
+   "subject": {
+    "status": "active",
+    "hire_date": "2020-01-01"
+   },
+   "evidence": [],
+   "expect": "fail",
+   "name": "Overdue acknowledgment fails"
+  }
+ ]
+}
