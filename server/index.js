@@ -23,9 +23,11 @@ P.on('sync_connector', (t, p) => C.syncConnector(t, p.id));
 function tick() {
   const today = clock.today();
   for (const tn of db.all('SELECT id FROM tenants')) {
-    P.enqueue(tn.id, 'evaluate_tenant', { trigger: 'scheduled_check' }, { dedupe: `daily:${tn.id}:${today}` });
+    // Daily jobs: `once` stops them from running again every minute after they finish.
+    P.enqueue(tn.id, 'evaluate_tenant', { trigger: 'scheduled_check' }, { dedupe: `daily:${tn.id}:${today}`, once: true });
+    // Reminders run every minute on purpose: each case has its own next_reminder_at time.
     P.enqueue(tn.id, 'run_reminders', {}, { dedupe: `rem:${tn.id}` });
-    for (const c of db.all("SELECT id FROM connectors WHERE tenant_id=? AND type='hrms' AND status!='disabled'", tn.id)) P.enqueue(tn.id, 'sync_connector', { id: c.id }, { dedupe: `sync:${c.id}:${today}` });
+    for (const c of db.all("SELECT id FROM connectors WHERE tenant_id=? AND type='hrms' AND status!='disabled'", tn.id)) P.enqueue(tn.id, 'sync_connector', { id: c.id }, { dedupe: `sync:${c.id}:${today}`, once: true });
     for (const s of db.all('SELECT * FROM schedules WHERE tenant_id=? AND enabled=1 AND next_run_at<=?', tn.id, clock.iso())) {
       P.enqueue(tn.id, s.kind, {}, { dedupe: `${s.id}:${s.next_run_at}` });
       db.update('schedules', s.id, { next_run_at: new Date(clock.now().getTime() + (s.cadence === 'weekly' ? 7 : 1) * 864e5).toISOString() });

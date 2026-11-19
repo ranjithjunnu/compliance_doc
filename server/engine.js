@@ -14,18 +14,20 @@ function loadCtx(t, type, s) {
   const facility = type === 'worker' ? currentFacility(t, s.id) : null;
   return { today: clock.today(), evidence, facility, facilityReqs: facility ? j(facility.requirements_json, []) : [] };
 }
+// Saves the new result and returns the previous status (null for a first check),
+// so the case logic can tell when a check gets worse, for example from "expiring" to "expired".
 function recordEvaluation(t, type, s, c, r, trigger) {
   const cur = db.get('SELECT * FROM evaluations WHERE tenant_id=? AND subject_type=? AND subject_id=? AND control_key=? AND is_current=1', t, type, s.id, c.key);
   const evs = JSON.stringify(r.evidence_ids);
   if (cur && cur.status === r.status && cur.reason === r.reason && cur.control_version === c.version_label && cur.evidence_ids_json === evs) {
     db.update('evaluations', cur.id, { evaluated_at: clock.iso(), action_needed: r.action_needed ? 1 : 0 });
-    return cur;
+    return cur.status;
   }
   if (cur) db.update('evaluations', cur.id, { is_current: 0 });
   const row = { id: id('eval'), tenant_id: t, subject_type: type, subject_id: s.id, pack_key: c.pack_key, control_key: c.key, control_version: c.version_label, status: r.status, code: r.code, reason: r.reason, evidence_ids_json: evs, action_needed: r.action_needed ? 1 : 0, trigger, is_current: 1, created_at: clock.iso(), evaluated_at: clock.iso() };
   db.insert('evaluations', row);
   P.audit(t, 'CHECK_RESULT', s.name, `${c.name}: ${r.status.toUpperCase()}. ${r.reason}`, { name: 'Control Evaluator' }, { detail: { control_version: c.version_label, evidence_ids: r.evidence_ids, trigger } });
-  return row;
+  return cur ? cur.status : null;
 }
 function audience(t, cs) {
   if (cs.subject_type === 'worker') { const w = db.get('SELECT * FROM workers WHERE id=?', cs.subject_id); return { worker: w }; }
@@ -82,27 +84,56 @@ function closeCase(t, cs, closure, evIds, why) {
   db.run("UPDATE actions SET status='cancelled' WHERE tenant_id=? AND case_id=? AND status='pending_approval'", t, cs.id);
   P.audit(t, 'CASE_CLOSED', cs.subject_name, `${cs.control_name}: closed (${closure.replace(/_/g, ' ')}). ${why}`, { name: 'Control Evaluator' }, { case_id: cs.id, detail: { evidence: realEv } });
 }
-function reconcile(t, type, s, c, r) {
+const firstName = (name) => String(name || '').split(/[ ,]/)[0];
+const noEndStop = (s) => String(s || '').trim().replace(/[.!?]+$/, '');
+// The gap as of right now, so a reminder says "expires in 16 days", not the count from the last check.
+function currentGap(t, cs, c) {
+  const s = db.get(`SELECT * FROM ${cs.subject_type === 'worker' ? 'workers' : 'entities'} WHERE id=? AND tenant_id=?`, cs.subject_id, t);
+  if (!s) return cs.gap;
+  const r = evaluate(c, { ...s, attrs: j(s.attrs_json, {}) }, loadCtx(t, cs.subject_type, s));
+  return r.action_needed ? r.reason : cs.gap;
+}
+const decisionDetail = (gap) => `${gap} Decide whether the assignment should continue. Aegis records your decision and does not change the assignment itself.`;
+
+// Critical alert to the owner when a high-priority check fails. One alert per kind of failure
+// (for example "expired on 2026-12-09"), checked before sending so the duplicate counter stays honest.
+function alertCritical(t, cs, c, s, r) {
+  const o = owner(t, cs), key = `${cs.id}:alert:${r.code}:${r.due || ''}`;
+  if (r.status !== 'fail' || cs.priority !== 'high' || c.mode !== 'auto' || !o) return;
+  if (db.get('SELECT 1 AS x FROM actions WHERE tenant_id=? AND idempotency_key=?', t, key)) return;
+  enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'notify', idempotency_key: key, recipient: o.name, recipient_type: 'owner', subject: `Critical: ${c.name}`, body: c.restricted ? 'A critical restricted finding is waiting in Aegis.' : `${s.name}: ${r.reason}` });
+}
+
+function reconcile(t, type, s, c, r, prevStatus = null) {
   const open = db.get(`SELECT * FROM cases WHERE tenant_id=? AND subject_type=? AND subject_id=? AND control_key=? AND ${OPEN}`, t, type, s.id, c.key);
   if (!r.action_needed) {
     if (open) closeCase(t, open, r.status === 'pass' ? 'verified' : 'no_longer_applicable', r.evidence_ids, r.reason);
     return;
   }
   const priority = r.status === 'fail' || (r.code === 'expiring' && r.days <= 14) ? 'high' : c.priority || 'medium';
-  const due = r.due || addDays(clock.today(), 7);
+  // A real deadline from the rule (expiry date, hire date + N days) always wins. Without one, the case keeps
+  // the date it got when it opened, so it can become overdue instead of moving forward on every check.
+  const due = r.due || open?.due_date || addDays(clock.today(), 7);
   if (!open) {
     const cs = { id: shortId('CASE'), tenant_id: t, subject_type: type, subject_id: s.id, subject_name: s.name, pack_key: c.pack_key, control_key: c.key, control_name: c.name, state: 'identified', gap: r.reason, gap_kind: r.gap_kind, priority, owner_user_id: c.owner_user_id, owner_team: c.team, restricted: c.restricted ? 1 : 0, due_date: due, opened_at: clock.iso() };
     db.insert('cases', cs);
     P.audit(t, 'CASE_OPENED', s.name, `${c.name}: gap identified. ${r.reason}`, SYSTEM, { case_id: cs.id });
     setState(t, cs, 'assigned', `Assigned to ${c.team}.`);
     planNext(t, cs, c);
-    const o = owner(t, cs);
-    if (r.status === 'fail' && priority === 'high' && c.mode === 'auto' && o) enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'notify', idempotency_key: `${cs.id}:alert:1`, recipient: o.name, recipient_type: 'owner', subject: `Critical: ${c.name}`, body: c.restricted ? 'A critical restricted finding is waiting in Aegis.' : `${s.name}: ${r.reason}` });
+    alertCritical(t, cs, c, s, r);
     return;
   }
-  const wasReview = open.gap_kind === 'review', wasData = open.gap_kind === 'data';
+  const wasReview = open.gap_kind === 'review', wasData = open.gap_kind === 'data', gapChanged = open.gap !== r.reason;
   db.update('cases', open.id, { gap: r.reason, gap_kind: r.gap_kind, priority, due_date: due });
-  Object.assign(open, { gap: r.reason, gap_kind: r.gap_kind });
+  Object.assign(open, { gap: r.reason, gap_kind: r.gap_kind, priority, due_date: due });
+  // A waiting assignment decision must show the current situation, not the one from when it was created.
+  if (gapChanged) {
+    const waiting = db.all("SELECT id FROM approvals WHERE tenant_id=? AND case_id=? AND kind='assignment_review' AND status='pending'", t, open.id);
+    for (const a of waiting) db.update('approvals', a.id, { detail: decisionDetail(r.reason) });
+    if (waiting.length && prevStatus !== r.status) P.audit(t, 'APPROVAL_UPDATED', s.name, `${c.name}: waiting decision updated. ${r.reason}`, SYSTEM, { case_id: open.id });
+  }
+  // An open case that just got worse (for example a credential that expired) alerts the owner again.
+  if (prevStatus !== 'fail') alertCritical(t, open, c, s, r);
   if (wasReview && r.gap_kind !== 'review' && open.state === 'in_review') {
     // Reviewed evidence was rejected or withdrawn, so the case returns to chasing. It does not close.
     const sent = db.get(`SELECT 1 x FROM actions WHERE case_id=? AND status='sent' AND type IN ('request_evidence','owner_task')`, open.id);
@@ -120,7 +151,10 @@ function notifyRejected(t, ev, reason) {
   const c = R.effectiveControls(t).find((x) => x.key === ev.control_key);
   if (!cs || !c || c.mode !== 'auto') return;
   const { worker } = audience(t, cs), o = owner(t, cs), toW = worker && c.remediation?.route === 'worker';
-  enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'notify', idempotency_key: `${cs.id}:rejected:${ev.id}`, recipient: toW ? worker.name : o?.name, recipient_type: toW ? 'worker' : 'owner', subject: `Please resubmit: ${c.name}`, body: c.restricted ? 'A restricted document needs to be resubmitted. Open Aegis for details.' : `The document you sent for ${c.name} could not be accepted: ${reason}. Please upload a replacement: ${newLink(t, cs)}` });
+  const body = toW
+    ? `Hi ${firstName(worker.name)}, the document you sent for your ${c.name} could not be accepted: ${noEndStop(reason)}. Please upload a replacement using your secure link: ${newLink(t, cs)}`
+    : `The document sent for ${cs.subject_name}'s ${c.name} could not be accepted: ${noEndStop(reason)}. Please upload a replacement: ${newLink(t, cs)}`;
+  enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'notify', idempotency_key: `${cs.id}:rejected:${ev.id}`, recipient: toW ? worker.name : o?.name, recipient_type: toW ? 'worker' : 'owner', subject: `Please resubmit: ${c.name}`, body: c.restricted ? 'A restricted document needs to be resubmitted. Open Aegis for details.' : body });
 }
 function evaluateSubject(t, type, s, trigger, only) {
   const controls = R.effectiveControls(t).filter((c) => c.subject === type && (!only || c.key === only));
@@ -128,8 +162,8 @@ function evaluateSubject(t, type, s, trigger, only) {
   const ctx = loadCtx(t, type, s);
   return db.tx(() => controls.map((c) => {
     const r = evaluate(c, subject, ctx);
-    recordEvaluation(t, type, s, c, r, trigger);
-    reconcile(t, type, s, c, r);
+    const prevStatus = recordEvaluation(t, type, s, c, r, trigger);
+    reconcile(t, type, s, c, r, prevStatus);
     return { control: c.key, ...r };
   }));
 }
@@ -163,7 +197,8 @@ async function sendAction(t, { action_id }) {
     const channel = await channels.deliver(tn, { ...a, recipient_slack: slack, recipient_email: email });
     db.tx(() => {
       db.update('actions', a.id, { status: 'sent', sent_at: clock.iso(), error: null });
-      P.audit(t, a.type === 'reminder' ? 'AUTO_REMINDER' : 'MESSAGE_SENT', a.recipient, `${a.subject} (via ${channel})`, a.automated ? SYSTEM : { name: a.created_by }, { case_id: a.case_id });
+      const how = channel === 'outbox' ? 'kept in the Aegis outbox: no email or Slack is set up for this person, so it did not leave Aegis' : `sent by ${channel}`;
+      P.audit(t, a.type === 'reminder' ? 'AUTO_REMINDER' : 'MESSAGE_SENT', a.recipient, `${a.subject} (${how})`, a.automated ? SYSTEM : { name: a.created_by }, { case_id: a.case_id });
       if (a.automated) P.bump(t, 'automated_messages');
       if (cs && ['request_evidence', 'owner_task', 'reminder', 'follow_up'].includes(a.type)) {
         const c = R.effectiveControls(t).find((x) => x.key === cs.control_key);
@@ -187,14 +222,20 @@ function runReminders(t) {
     if (cs.reminders_sent < max) {
       const n = cs.reminders_sent + 1, { worker } = audience(t, cs), o = owner(t, cs), toW = worker && c.remediation?.route === 'worker';
       db.update('cases', cs.id, { next_reminder_at: null });
-      enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'reminder', idempotency_key: `${cs.id}:reminder:${n}`, recipient: toW ? worker.name : o?.name || cs.owner_team, recipient_type: toW ? 'worker' : 'owner', subject: `Reminder ${n}: ${c.name}`, body: c.restricted ? `Reminder ${n}: a restricted ${c.pack_name} review is waiting in Aegis.` : `Reminder ${n}: ${cs.subject_name} still needs ${c.name}. ${cs.gap}${toW ? ` Upload: ${newLink(t, cs)}` : ''}` });
+      const gap = currentGap(t, cs, c);
+      const body = c.restricted
+        ? `Reminder ${n}: a restricted ${c.pack_name} review is waiting in Aegis.`
+        : toW
+          ? `Hi ${firstName(worker.name)}, this is reminder ${n} about your ${c.name}. ${gap} Please upload it using your secure link: ${newLink(t, cs)}`
+          : `Reminder ${n}: ${cs.subject_name} still needs ${c.name}. ${gap}`;
+      enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'reminder', idempotency_key: `${cs.id}:reminder:${n}`, recipient: toW ? worker.name : o?.name || cs.owner_team, recipient_type: toW ? 'worker' : 'owner', subject: `Reminder ${n}: ${c.name}`, body });
     } else if (!cs.escalated) {
       db.update('cases', cs.id, { escalated: 1, next_reminder_at: null });
-      const o = owner(t, cs);
-      enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'escalation', idempotency_key: `${cs.id}:escalate:1`, recipient: o?.name || cs.owner_team, recipient_type: 'owner', subject: `Escalated: ${c.name}`, body: c.restricted ? 'A restricted case is unresolved after all reminders.' : `${cs.subject_name}: ${cs.gap} No accepted evidence after ${max} reminders.` });
+      const o = owner(t, cs), gap = currentGap(t, cs, c);
+      enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'escalation', idempotency_key: `${cs.id}:escalate:1`, recipient: o?.name || cs.owner_team, recipient_type: 'owner', subject: `Escalated: ${c.name}`, body: c.restricted ? 'A restricted case is unresolved after all reminders.' : `${cs.subject_name}: ${gap} No accepted evidence after ${max} reminders.` });
       P.audit(t, 'CASE_ESCALATED', cs.subject_name, `${c.name}: escalated after ${max} unanswered reminders.`, SYSTEM, { case_id: cs.id });
       if (c.remediation?.on_escalate === 'assignment_review') {
-        db.insert('approvals', { id: id('apr'), tenant_id: t, kind: 'assignment_review', ref_id: cs.id, case_id: cs.id, pack_key: cs.pack_key, title: `Assignment decision: ${cs.subject_name}`, detail: `${cs.gap} Decide whether the assignment should continue. Aegis records your decision and does not change the assignment itself.`, requested_by: SYSTEM.name, created_at: clock.iso() });
+        db.insert('approvals', { id: id('apr'), tenant_id: t, kind: 'assignment_review', ref_id: cs.id, case_id: cs.id, pack_key: cs.pack_key, title: `Assignment decision: ${cs.subject_name}`, detail: decisionDetail(gap), requested_by: SYSTEM.name, created_at: clock.iso() });
       }
     }
   }
@@ -221,7 +262,13 @@ function followUp(t, user, cs) {
   if (c.mode !== 'auto') return { sent: false, message: 'This pack is in validation mode, so nothing was sent.' };
   if (cs.gap_kind === 'review') return { sent: false, message: 'Evidence is already awaiting review.' };
   const { worker } = audience(t, cs), o = owner(t, cs), toW = worker && c.remediation?.route === 'worker' && cs.gap_kind !== 'data';
-  const a = enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'follow_up', idempotency_key: `${cs.id}:manual:${clock.today()}`, recipient: toW ? worker.name : o?.name, recipient_type: toW ? 'worker' : 'owner', subject: `Follow-up: ${c.name}`, body: c.restricted ? 'A restricted review needs your attention in Aegis.' : `${cs.subject_name}: ${cs.gap}${cs.gap_kind !== 'data' ? ` Upload: ${newLink(t, cs)}` : ''}` }, user);
+  const gap = currentGap(t, cs, c);
+  const body = c.restricted
+    ? 'A restricted review needs your attention in Aegis.'
+    : toW
+      ? `Hi ${firstName(worker.name)}, a follow-up from your compliance team about your ${c.name}. ${gap} Please upload it using your secure link: ${newLink(t, cs)}`
+      : `${cs.subject_name}: ${gap}${cs.gap_kind !== 'data' ? ` Upload: ${newLink(t, cs)}` : ''}`;
+  const a = enqueueAction(t, { case_id: cs.id, pack_key: cs.pack_key, type: 'follow_up', idempotency_key: `${cs.id}:manual:${clock.today()}`, recipient: toW ? worker.name : o?.name, recipient_type: toW ? 'worker' : 'owner', subject: `Follow-up: ${c.name}`, body }, user);
   return a.duplicate ? { sent: false, message: 'A follow-up was already sent today.' } : { sent: true, message: `Follow-up queued for ${toW ? worker.name : o?.name}.` };
 }
 function recordVerdict(t, user, cs, verdict, note) {

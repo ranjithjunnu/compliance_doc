@@ -30,6 +30,7 @@ CREATE TABLE IF NOT EXISTS submission_tokens(token_hash TEXT PRIMARY KEY, tenant
 CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, source TEXT, external_id TEXT, type TEXT, payload_json TEXT, status TEXT, received_at TEXT, processed_at TEXT, error TEXT, UNIQUE(tenant_id,source,external_id));
 CREATE TABLE IF NOT EXISTS jobs(id TEXT PRIMARY KEY, tenant_id TEXT, type TEXT, payload_json TEXT, run_at TEXT, status TEXT, attempts INT DEFAULT 0, max_attempts INT DEFAULT 5, last_error TEXT, dedupe_key TEXT, locked_at TEXT, created_at TEXT, finished_at TEXT);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_job ON jobs(dedupe_key) WHERE dedupe_key IS NOT NULL AND status IN ('queued','running');
+CREATE INDEX IF NOT EXISTS ix_job_dedupe ON jobs(dedupe_key);
 CREATE INDEX IF NOT EXISTS ix_jobs ON jobs(status,run_at);
 CREATE TABLE IF NOT EXISTS schedules(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, kind TEXT, cadence TEXT, next_run_at TEXT, enabled INT DEFAULT 1, config_json TEXT DEFAULT '{}');
 CREATE TABLE IF NOT EXISTS connectors(id TEXT PRIMARY KEY, tenant_id TEXT NOT NULL, type TEXT, name TEXT, config_enc TEXT, cursor TEXT, status TEXT, capabilities_json TEXT DEFAULT '[]', last_sync_at TEXT, last_error TEXT, records INT DEFAULT 0);
@@ -44,6 +45,18 @@ CREATE TABLE IF NOT EXISTS audit_log(seq INTEGER PRIMARY KEY AUTOINCREMENT, tena
 CREATE INDEX IF NOT EXISTS ix_audit ON audit_log(tenant_id,seq);
 CREATE TRIGGER IF NOT EXISTS audit_no_update BEFORE UPDATE ON audit_log BEGIN SELECT RAISE(ABORT,'audit_log is append-only'); END;
 CREATE TRIGGER IF NOT EXISTS audit_no_delete BEFORE DELETE ON audit_log BEGIN SELECT RAISE(ABORT,'audit_log is append-only'); END;
+`;
+
+// Postgres version of SCHEMA: same tables, with Postgres types and triggers.
+// chat_messages gets an explicit rowid so "ORDER BY created_at, rowid" works on both databases.
+const PG_SCHEMA = SCHEMA
+  .replace(/^CREATE TRIGGER.*$/gm, '')
+  .replace('seq INTEGER PRIMARY KEY AUTOINCREMENT', 'seq INTEGER PRIMARY KEY')
+  .replace(/ REAL\b/g, ' DOUBLE PRECISION')
+  .replace('chat_messages(id TEXT PRIMARY KEY,', 'chat_messages(rowid SERIAL, id TEXT PRIMARY KEY,') + `
+CREATE OR REPLACE FUNCTION aegis_audit_append_only() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit_log is append-only'; END $$;
+DROP TRIGGER IF EXISTS audit_no_change ON audit_log;
+CREATE TRIGGER audit_no_change BEFORE UPDATE OR DELETE ON audit_log FOR EACH ROW EXECUTE FUNCTION aegis_audit_append_only();
 `;
 
 let mode = 'sqlite'; // 'pg' or 'sqlite'
@@ -98,9 +111,21 @@ function pgExecSync(type, sql, params = []) {
   return res.data;
 }
 
+// Separate PG* settings win over DATABASE_URL. They are encoded here, so a
+// password with @, #, : or / works without hand-encoding.
+function pgConnectionString() {
+  const { PGHOST, PGPORT, PGUSER, PGPASSWORD, PGDATABASE } = process.env;
+  if (PGUSER && PGDATABASE) {
+    const auth = encodeURIComponent(PGUSER) + (PGPASSWORD ? ':' + encodeURIComponent(PGPASSWORD) : '');
+    return `postgresql://${auth}@${PGHOST || 'localhost'}:${PGPORT || 5432}/${encodeURIComponent(PGDATABASE)}`;
+  }
+  return process.env.DATABASE_URL || 'postgresql://AI_compliance:Work%40123@localhost:5432/ai_compliance';
+}
+
 function open(file) {
   const isTest = process.env.NODE_ENV === 'test' || /aegis-(ai-)?[a-zA-Z0-9]+/.test(process.env.AEGIS_DATA || '');
-  const pgUrl = !isTest ? (process.env.DATABASE_URL || 'postgresql://AI_compliance:Work%40123@localhost:5432/ai_compliance') : null;
+  // Tests use SQLite unless AEGIS_TEST_DATABASE_URL points them at a Postgres database.
+  const pgUrl = isTest ? (process.env.AEGIS_TEST_DATABASE_URL || null) : pgConnectionString();
   if (pgUrl) {
     try {
       const sab = new SharedArrayBuffer(8 * 1024 * 1024); // 8MB
@@ -111,13 +136,21 @@ function open(file) {
         workerData: { sab, connectionString: pgUrl }
       });
 
-      Atomics.wait(pgInt32, 0, 0);
+      // Time limit, so a crashed worker (for example, the pg package is not installed) cannot freeze startup.
+      if (Atomics.wait(pgInt32, 0, 0, 15000) === 'timed-out') throw new Error('no answer from the database worker. Run "npm install" and check that PostgreSQL is running.');
       if (pgInt32[2] === 0) {
         mode = 'pg';
         console.log(`[db] Connected to PostgreSQL at ${pgUrl.replace(/:[^:]*@/, ':****@')}`);
+        // Every schema statement is safe to re-run, so it runs on each start. That way new tables
+        // and indexes also reach an existing database. Changing an existing column still needs a migration.
+        const fresh = !get("SELECT to_regclass('tenants') AS t").t;
+        exec(PG_SCHEMA);
+        if (fresh) console.log('[db] Created the Aegis tables in PostgreSQL.');
         return;
       }
+      pgWorker.terminate();
     } catch (err) {
+      if (pgWorker) pgWorker.terminate();
       console.warn('[db] PostgreSQL connection failed, falling back to SQLite:', err.message);
     }
   }
@@ -126,9 +159,7 @@ function open(file) {
   mode = 'sqlite';
   sqliteDb = new DatabaseSync(file);
   sqliteDb.exec('PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;');
-  if (!sqliteDb.prepare("SELECT name FROM sqlite_master WHERE name='tenants'").get()) {
-    sqliteDb.exec(SCHEMA);
-  }
+  sqliteDb.exec(SCHEMA); // safe to re-run; adds new tables and indexes to an existing file
   console.log('[db] Using SQLite at', file);
 }
 
@@ -220,11 +251,11 @@ function update(table, idv, row, idc = 'id') {
 
 function resetAll() {
   if (mode === 'pg') {
-    const tables = all("SELECT table_name AS name FROM information_schema.tables WHERE table_schema='public' AND table_type='BASE TABLE'");
+    const tables = all("SELECT table_name AS name FROM information_schema.tables WHERE table_schema=current_schema() AND table_type='BASE TABLE'");
     for (const t of tables) {
       exec(`DROP TABLE IF EXISTS "${t.name}" CASCADE`);
     }
-    exec(SCHEMA);
+    exec(PG_SCHEMA);
     return;
   }
   sqliteDb.exec('PRAGMA foreign_keys=OFF');

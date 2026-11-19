@@ -13,7 +13,7 @@ function loadPacks() {
       const got = evaluate(c, t.subject, { today: clock.today(), evidence: t.evidence }).status;
       return { name: t.name, control: t.control, expect: t.expect, got, ok: got === t.expect };
     });
-    db.run('INSERT OR REPLACE INTO packs(key,version,definition_json,validation_json) VALUES(?,?,?,?)', p.key, p.version, JSON.stringify(p), JSON.stringify(results));
+    db.run('INSERT INTO packs(key,version,definition_json,validation_json) VALUES(?,?,?,?) ON CONFLICT(key,version) DO UPDATE SET definition_json=excluded.definition_json, validation_json=excluded.validation_json', p.key, p.version, JSON.stringify(p), JSON.stringify(results));
   }
 }
 const packDef = (key, ver) => {

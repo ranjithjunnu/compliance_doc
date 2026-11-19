@@ -75,6 +75,10 @@ async function sendEmail(to, subject, text) {
   return null;
 }
 
+// Message status is honest:
+// - "sent": an email or Slack provider accepted the message. (Whether it reached the inbox is not known.)
+// - "outbox": no email or Slack is set up for this recipient, so the message stayed inside Aegis.
+// If an email or Slack provider is set up but fails, delivery throws, so the job retries and the failure is visible.
 async function deliver(tenant, action) {
   if (hooks.failNext > 0) { hooks.failNext--; throw new Error('Simulated channel failure'); }
   const ch = j(tenant.channel_json, { type: 'outbox' });
@@ -95,14 +99,12 @@ async function deliver(tenant, action) {
   // Try Email (if recipient has an email address)
   else if (action.recipient_email || (action.recipient && action.recipient.includes('@'))) {
     const to = action.recipient_email || action.recipient;
-    try {
-      const emailRef = await sendEmail(to, action.subject, action.body);
-      if (emailRef) {
-        channel = 'email';
-        ref = emailRef;
-      }
-    } catch (e) {
-      console.warn(`[channels] Email delivery failed to ${to}:`, e.message);
+    const emailRef = await sendEmail(to, action.subject, action.body).catch((e) => {
+      throw new Error(`Email to ${to} failed: ${e.message}`);
+    });
+    if (emailRef) {
+      channel = 'email';
+      ref = emailRef;
     }
   }
 
@@ -114,7 +116,7 @@ async function deliver(tenant, action) {
     recipient: action.recipient,
     subject: action.subject,
     body: action.body,
-    status: 'delivered',
+    status: channel === 'outbox' ? 'outbox' : 'sent',
     provider_ref: ref,
     created_at: clock.iso()
   });
@@ -130,7 +132,7 @@ function post(tenant, recipient, subject, body) {
     recipient,
     subject,
     body,
-    status: 'delivered',
+    status: 'outbox',
     created_at: clock.iso()
   });
 }

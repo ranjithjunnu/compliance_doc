@@ -194,3 +194,88 @@ test('external customer: spreadsheet onboarding works without a connector', asyn
   const cov = (await n.post('/api/setup/assess')).data; assert.ok(cov.total > 0); assert.equal(cov.pass, 0, 'no evidence means no passes');
   assert.equal(db.get("SELECT COUNT(*) n FROM actions WHERE tenant_id=(SELECT id FROM tenants WHERE slug='northstar')").n, 0, 'new tenants start in validation mode');
 });
+
+test('daily jobs (scheduled check, HRMS sync) run once a day, not every minute', async () => {
+  const { tick } = require('../server/index.js'), { clock } = require('../server/lib/util');
+  const t = bid().id, con = db.get("SELECT id FROM connectors WHERE tenant_id=? AND type='hrms'", t);
+  const jobs = (key) => db.get('SELECT COUNT(*) AS n FROM jobs WHERE dedupe_key=?', key).n;
+  const syncAudits = () => db.get("SELECT COUNT(*) AS n FROM audit_log WHERE tenant_id=? AND type='HRMS_SYNC'", t).n;
+  const today = clock.today(), auditsBefore = syncAudits();
+  // Three "minutes" pass, and every job finishes before the next minute starts.
+  for (let i = 0; i < 3; i++) { tick(); await P.drain(); }
+  assert.equal(jobs(`daily:${t}:${today}`), 1, 'the daily check runs once');
+  assert.equal(jobs(`sync:${con.id}:${today}`), 1, 'the HRMS sync runs once');
+  assert.ok(syncAudits() - auditsBefore <= 1, 'the audit log does not fill with sync entries');
+  assert.equal(jobs(`rem:${t}`), 3, 'reminders are still checked every minute');
+  // The next day, the daily jobs run again.
+  clock.advanceDays(1);
+  tick(); await P.drain();
+  assert.equal(jobs(`daily:${t}:${clock.today()}`), 1);
+  assert.equal(jobs(`sync:${con.id}:${clock.today()}`), 1);
+});
+
+test('deadlines do not slide, and a credential that expires on an open case alerts the owner and refreshes the decision', async () => {
+  const { clock, addDays } = require('../server/lib/util');
+  const today = clock.today();
+  await admin.post('/api/workers', { name: 'Tara Test', email: 'tara.test@bluebix.demo', role: 'Staff Nurse', category: 'clinical', license_type: 'RN', facility: 'Kaiser Permanente', facility_state: 'CA', entity: 'Bluebix Healthcare LLC', hire_date: today });
+  await P.drain();
+  const w = db.get("SELECT * FROM workers WHERE name='Tara Test'");
+  const card = file('bls.txt', `Basic Life Support (BLS) Provider Card\nName: Tara Test\nCard Number: BLS-T1\nExpires: ${addDays(today, 20)}\n`);
+  assert.equal((await admin.post('/api/evidence', { subject_type: 'worker', subject_id: w.id, control_key: 'CTRL-HC-BLS', file: card })).data.status, 'accepted');
+  await P.drain();
+  const caseOf = (key) => db.get('SELECT * FROM cases WHERE subject_id=? AND control_key=? AND closed_at IS NULL', w.id, key);
+  const bls = caseOf('CTRL-HC-BLS'), lic = caseOf('CTRL-HC-LICENSE');
+  assert.ok(bls && lic, 'the expiring card and the missing license both open cases');
+  const alerts = () => db.all("SELECT * FROM actions WHERE case_id=? AND subject LIKE 'Critical:%'", bls.id);
+  assert.equal(alerts().length, 0, 'no critical alert while the card is still valid');
+
+  // 16 days pass: reminders go unanswered and the BLS case escalates to a decision.
+  for (let i = 0; i < 4; i++) await admin.post('/api/demo/advance', { days: 4 });
+  assert.equal(caseOf('CTRL-HC-LICENSE').due_date, lic.due_date, 'a case without a fixed deadline keeps its first due date');
+  const decision = () => db.get("SELECT * FROM approvals WHERE case_id=? AND kind='assignment_review' AND status='pending'", bls.id);
+  assert.ok(decision(), 'escalation created a waiting decision');
+  assert.match(decision().detail, /valid but expires/);
+
+  // The card expires.
+  await admin.post('/api/demo/advance', { days: 6 });
+  assert.equal(caseOf('CTRL-HC-BLS').due_date, addDays(today, 20), 'the expiry date stays the deadline');
+  assert.equal(alerts().length, 1, 'the owner is alerted when the card actually expires');
+  assert.match(alerts()[0].body, /expired/);
+  assert.match(decision().detail, /expired/, 'the waiting decision shows the current situation');
+
+  // Another day: still one alert, not a new one every day.
+  await admin.post('/api/demo/advance', { days: 1 });
+  assert.equal(alerts().length, 1);
+});
+
+test('message status is honest and messages to a worker are written to them, with current numbers', async () => {
+  // Nothing is set up for email or Slack in tests, so every message stays in the outbox and says so.
+  assert.equal(db.get("SELECT COUNT(*) AS n FROM messages WHERE status='delivered'").n, 0);
+  assert.ok(db.get("SELECT COUNT(*) AS n FROM messages WHERE channel='outbox' AND status='outbox'").n > 0);
+  assert.ok(db.get("SELECT 1 AS x FROM audit_log WHERE action LIKE '%did not leave Aegis%'"), 'the audit log says the message did not leave Aegis');
+
+  // An email provider that fails is not hidden: delivery throws, so the job retries and the failure shows.
+  const realFetch = globalThis.fetch;
+  process.env.RESEND_API_KEY = 'test-key';
+  globalThis.fetch = (url, opts) => String(url).includes('api.resend.com') ? Promise.resolve(new Response(JSON.stringify({ message: 'provider down' }), { status: 500 })) : realFetch(url, opts);
+  try {
+    await assert.rejects(channels.deliver(bid(), { id: 'act_test', recipient: 'Tara Test', recipient_email: 'tara.test@bluebix.demo', subject: 'S', body: 'B' }), /Email to tara.test@bluebix.demo failed/);
+  } finally { globalThis.fetch = realFetch; delete process.env.RESEND_API_KEY; }
+
+  // Reminders to the worker use "Hi Tara" and the day count from the day they are sent.
+  const w = db.get("SELECT * FROM workers WHERE name='Tara Test'");
+  const r1 = db.get("SELECT body FROM messages WHERE recipient='Tara Test' AND subject='Reminder 1: BLS provider card'");
+  assert.match(r1.body, /^Hi Tara, this is reminder 1 about your BLS provider card\./);
+  assert.match(r1.body, /expires in 16 day\(s\)/, 'sent 4 days after upload of a card valid for 20 days');
+  assert.doesNotMatch(r1.body, /Tara Test still needs/);
+
+  // A rejection reason that ends with a full stop does not produce "..".
+  const lic = file('lic.txt', 'Registered Nurse License\nName: Tamara Testa\nLicense No: RN-9\nState: CA\nExpiration Date: 2029-01-01\n');
+  const up = await admin.post('/api/evidence', { subject_type: 'worker', subject_id: w.id, control_key: 'CTRL-HC-LICENSE', file: lic });
+  assert.equal(up.data.status, 'needs_review');
+  await admin.post(`/api/evidence/${up.data.id}/review`, { decision: 'reject', reason: 'Name on the license does not match the worker.' });
+  await P.drain();
+  const rej = db.get("SELECT body FROM messages WHERE recipient='Tara Test' AND subject='Please resubmit: Professional license'");
+  assert.match(rej.body, /^Hi Tara, the document you sent for your Professional license could not be accepted: Name on the license does not match the worker\. Please upload/);
+  assert.doesNotMatch(rej.body, /\.\./);
+});

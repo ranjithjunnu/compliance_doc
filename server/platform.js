@@ -26,9 +26,15 @@ const counter = (t, key) => db.get('SELECT value FROM counters WHERE tenant_id=?
 // ---- durable jobs: every handler must be safe to run twice.
 const handlers = {};
 const on = (type, fn) => { handlers[type] = fn; };
-function enqueue(tenantId, type, payload = {}, { dedupe = null, runAt = null, max = 5 } = {}) {
-  db.run(`INSERT OR IGNORE INTO jobs(id,tenant_id,type,payload_json,run_at,status,max_attempts,dedupe_key,created_at) VALUES(?,?,?,?,?,'queued',?,?,?)`,
+// dedupe: a second job with the same key is skipped while the first is still queued or running.
+// once: the key may run only one time ever, even after the first job finished. Used for keys that
+// contain a date (for example the daily sync), so "once a day" really means once a day.
+// Returns true when a new job was added.
+function enqueue(tenantId, type, payload = {}, { dedupe = null, once = false, runAt = null, max = 5 } = {}) {
+  if (once && dedupe && db.get('SELECT 1 AS x FROM jobs WHERE dedupe_key=?', dedupe)) return false;
+  const r = db.run(`INSERT OR IGNORE INTO jobs(id,tenant_id,type,payload_json,run_at,status,max_attempts,dedupe_key,created_at) VALUES(?,?,?,?,?,'queued',?,?,?)`,
     id('job'), tenantId, type, JSON.stringify(payload), runAt || clock.iso(), max, dedupe, clock.iso());
+  return !!r?.changes;
 }
 let busy = null;
 async function runOne(force) {

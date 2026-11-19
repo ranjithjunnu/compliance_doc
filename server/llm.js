@@ -48,14 +48,14 @@ async function callTool(t, system, userContent, name, schema) {
     return out;
   } catch (e) {
     const msg = e.name === 'TimeoutError' ? 'The AI provider timed out.' : e.message;
-    db.run('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)', errKey(t), JSON.stringify({ message: msg, at: clock.iso() }));
+    db.run('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v', errKey(t), JSON.stringify({ message: msg, at: clock.iso() }));
     P.audit(t, 'AI_ERROR', 'AI engine', `AI call failed: ${msg} Work continues through human review.`);
     return null;
   }
 }
 const PING = { type: 'object', properties: { ok: { type: 'boolean' } }, required: ['ok'] };
 const test = (t, cfg) => request(t, cfg, 'Connection test. Call the tool with ok set to true.', [{ type: 'text', text: 'Connection test.' }], 'record_ping', PING);
-function save(t, cfg) { db.run('INSERT OR REPLACE INTO meta(k,v) VALUES(?,?)', metaKey(t), encrypt(Buffer.from(JSON.stringify(cfg))).toString('base64')); db.run('DELETE FROM meta WHERE k=?', errKey(t)); }
+function save(t, cfg) { db.run('INSERT INTO meta(k,v) VALUES(?,?) ON CONFLICT(k) DO UPDATE SET v=excluded.v', metaKey(t), encrypt(Buffer.from(JSON.stringify(cfg))).toString('base64')); db.run('DELETE FROM meta WHERE k=?', errKey(t)); }
 function remove(t) { db.run('DELETE FROM meta WHERE k=?', metaKey(t)); db.run('DELETE FROM meta WHERE k=?', errKey(t)); }
 function lastError(t) { const r = db.get('SELECT v FROM meta WHERE k=?', errKey(t)); return r ? JSON.parse(r.v) : null; }
 function status(t) {
